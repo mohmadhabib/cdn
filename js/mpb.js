@@ -1,4 +1,5 @@
-// mini-pb.js
+// mini-pb.js — JavaScript client for the single-file PHP backend
+
 export class MiniPB {
   /**
    * @param {string} baseUrl e.g. "http://localhost:8080"
@@ -10,13 +11,13 @@ export class MiniPB {
       get isAuth() { return !!this.token; },
       clear: () => { this.token = null; },
     };
-    // Hooks similar to PocketBase SDK style
+    // Optional hooks
     this.beforeSend = (url, options) => ({ url, options });
     this.afterSend = async (response, data) => data;
   }
 
   // ---------- Low-level send ----------
-  async send(path, { method = "GET", headers = {}, query, body, asForm = false } = {}) {
+  async send(path, { method = "GET", headers = {}, query, body, asForm = false, credentials = "include" } = {}) {
     const url = new URL(this.baseUrl + path);
     if (query && typeof query === "object") {
       for (const [k, v] of Object.entries(query)) {
@@ -25,19 +26,17 @@ export class MiniPB {
       }
     }
 
-    const opts = { method, headers: { ...headers } };
+    const opts = { method, headers: { ...headers }, credentials };
 
     // Authorization
     if (this.authStore.token) {
-      opts.headers["Authorization"] = `Bearer ${this.authStore.token}`;
+      opts.headers["Authorization"] = `Bearer ${this.authStore.token}`; // add bearer token [4][2]
     }
 
     // Body handling
     if (body !== undefined && body !== null) {
       if (asForm === true) {
-        // body should be FormData (for files) or URLSearchParams
-        opts.body = body;
-        // Let browser set Content-Type when FormData is used
+        opts.body = body; // FormData or URLSearchParams; do not set Content-Type manually
       } else {
         opts.headers["Content-Type"] = "application/json";
         opts.body = JSON.stringify(body);
@@ -47,7 +46,7 @@ export class MiniPB {
     // Hooks
     const { url: finalUrl, options } = this.beforeSend(url.toString(), opts);
 
-    const res = await fetch(finalUrl, options);
+    const res = await fetch(finalUrl, options); // Fetch API usage [7]
     const contentType = res.headers.get("content-type") || "";
     const isJson = contentType.includes("application/json");
     const data = isJson ? await res.json().catch(() => ({})) : await res.text();
@@ -76,7 +75,6 @@ export class MiniPB {
     this.authStore.clear();
   }
 
-  // Optional self-register
   async register(email, password) {
     return this.send("/api/auth/register", {
       method: "POST",
@@ -84,9 +82,9 @@ export class MiniPB {
     });
   }
 
-  // ---------- Collections ----------
+  // ---------- Records ----------
   /**
-   * List records with pagination and sorting.
+   * List records.
    * @param {string} name collection name
    * @param {{limit?:number, offset?:number, sort?:string}} params
    */
@@ -107,7 +105,7 @@ export class MiniPB {
   }
 
   /**
-   * Create a record. Accepts either a plain object (JSON) or FormData.
+   * Create a record. Accepts a plain object (JSON) or FormData.
    */
   async create(name, data, { form = false } = {}) {
     return this.send(`/api/collections/${encodeURIComponent(name)}/records`, {
@@ -118,7 +116,7 @@ export class MiniPB {
   }
 
   /**
-   * Update a record by id. Partial update using JSON body.
+   * Update a record by id (partial update).
    */
   async update(name, id, data) {
     return this.send(`/api/collections/${encodeURIComponent(name)}/records/${encodeURIComponent(id)}`, {
@@ -138,7 +136,7 @@ export class MiniPB {
 
   // ---------- Files ----------
   /**
-   * Upload a file. By default public=1.
+   * Upload a file; defaults to public.
    * @param {File|Blob} file
    * @param {{public?: boolean}} options
    */
@@ -150,10 +148,82 @@ export class MiniPB {
   }
 
   /**
-   * Build file URL for public/private file delivery.
-   * Private files still require Authorization header when fetched programmatically.
+   * Build a file URL; for private files, direct <img> tags won't send auth headers.
    */
   fileUrl(storedName) {
     return `${this.baseUrl}/files/${encodeURIComponent(storedName)}`;
+  }
+
+  // ---------- Admin: Collections (requires admin token) ----------
+  /**
+   * Create a collection.
+   * Server UI route expects form data; this supports both FormData and JSON.
+   * @param {string} name
+   * @param {Array<{name:string,type?:'TEXT'|'INTEGER'|'REAL'|'BLOB',required?:boolean,unique?:boolean}>} schema
+   * @param {{useForm?: boolean}} opts
+   */
+  async createCollection(name, schema = [], opts = {}) {
+    const useForm = !!opts.useForm;
+    if (useForm) {
+      const fd = new FormData();
+      fd.append("name", name);
+      fd.append("schema", JSON.stringify(schema));
+      return this.send("/admin/collections/new", {
+        method: "POST",
+        asForm: true,
+        body: fd,
+        // Many servers respond with HTML/redirects on admin routes; Accept header can hint JSON
+        headers: { Accept: "application/json, text/html;q=0.8" },
+      });
+    } else {
+      // Works only if the server treats JSON in this route; otherwise prefer useForm: true
+      return this.send("/admin/collections/new", {
+        method: "POST",
+        headers: { Accept: "application/json" },
+        body: { name, schema },
+      });
+    }
+  }
+
+  /**
+   * Update a collection (rename and/or schema).
+   * @param {string} currentName
+   * @param {{name?: string, schema?: Array}} changes
+   * @param {{useForm?: boolean}} opts
+   */
+  async updateCollection(currentName, changes = {}, opts = {}) {
+    const nextName = changes.name ?? currentName;
+    const schema = Array.isArray(changes.schema) ? changes.schema : undefined;
+    const useForm = !!opts.useForm;
+
+    if (useForm) {
+      const fd = new FormData();
+      fd.append("name", nextName);
+      if (schema) fd.append("schema", JSON.stringify(schema));
+      return this.send(`/admin/collections/${encodeURIComponent(currentName)}/edit`, {
+        method: "POST",
+        asForm: true,
+        body: fd,
+        headers: { Accept: "application/json, text/html;q=0.8" },
+      });
+    } else {
+      return this.send(`/admin/collections/${encodeURIComponent(currentName)}/edit`, {
+        method: "POST",
+        headers: { Accept: "application/json" },
+        body: { name: nextName, schema },
+      });
+    }
+  }
+
+  /**
+   * Delete a collection.
+   * @param {string} name
+   */
+  async deleteCollection(name) {
+    return this.send(`/admin/collections/${encodeURIComponent(name)}/delete`, {
+      method: "POST",
+      headers: { Accept: "application/json, text/html;q=0.8" },
+    });
+    // Note: Server may issue 302 redirect for HTML flows; fetch follows automatically.
   }
 }
