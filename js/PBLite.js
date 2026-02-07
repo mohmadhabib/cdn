@@ -1,43 +1,120 @@
 /**
- * PBLite - Async JS wrapper for the updated PHP API.
- * Uses collection_name instead of IDs for CRUD.
- * Persistent token with auto refresh from X-New-Token header.
+ * PBLite v2.1 - Improved CORS and authentication handling
  */
 class PBLite {
     constructor(baseUrl) {
         this.baseUrl = baseUrl.replace(/\/+$/, "");
         this.tokenKey = "pbl_token";
         this.token = localStorage.getItem(this.tokenKey) || null;
+        this.debug = false;
     }
 
-    _post(action, data = {}) {
-        if (this.token) data.token = this.token;
-        return fetch(this.baseUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({ action, ...data })
-        }).then(res => {
-            this._handleTokenRefresh(res);
-            return res.json();
-        });
+    async _request(method, action, data = {}, isFileUpload = false) {
+        const url = new URL(this.baseUrl);
+        const options = { 
+            method,
+            mode: 'cors',
+            credentials: 'omit'
+        };
+        
+        // Add token to request if we have one
+        if (this.token && this.token !== 'null' && this.token !== 'undefined') {
+            if (isFileUpload) {
+                if (data instanceof FormData) {
+                    data.append("token", this.token);
+                }
+            } else {
+                data.token = this.token;
+            }
+        }
+        
+        if (method === "GET") {
+            url.searchParams.append("action", action);
+            for (const [key, value] of Object.entries(data)) {
+                if (value !== null && value !== undefined) {
+                    url.searchParams.append(key, value);
+                }
+            }
+            
+            if (this.debug) {
+                console.log("GET Request:", url.toString());
+            }
+        } else {
+            if (isFileUpload) {
+                options.body = data;
+                // FormData automatically sets Content-Type with boundary
+            } else {
+                const formData = new FormData();
+                formData.append("action", action);
+                for (const [key, value] of Object.entries(data)) {
+                    if (value !== null && value !== undefined) {
+                        formData.append(key, value);
+                    }
+                }
+                options.body = formData;
+            }
+            
+            if (this.debug) {
+                console.log("POST Request:", action, data);
+            }
+        }
+        
+        try {
+            const response = await fetch(method === "GET" ? url : this.baseUrl, options);
+            
+            // Handle token refresh
+            const newToken = response.headers.get("X-New-Token");
+            if (newToken) {
+                console.log("🔄 Token auto-refreshed");
+                this.setToken(newToken);
+            }
+            
+            // Handle file downloads
+            if (action === "download_file") {
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        throw new Error(errorJson.error || "Download failed");
+                    } catch {
+                        throw new Error(errorText || "Download failed");
+                    }
+                }
+                return await response.blob();
+            }
+            
+            // Parse response
+            const responseText = await response.text();
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${responseText}`);
+            }
+            
+            // Try to parse as JSON
+            try {
+                const result = JSON.parse(responseText);
+                
+                if (result.error) {
+                    throw new Error(result.error);
+                }
+                
+                return result;
+            } catch (jsonError) {
+                // Not JSON, return as-is
+                return responseText;
+            }
+        } catch (error) {
+            console.error("PBLite request error:", error);
+            throw error;
+        }
     }
 
     _get(action, params = {}) {
-        if (this.token) params.token = this.token;
-        const url = new URL(this.baseUrl);
-        url.search = new URLSearchParams({ action, ...params }).toString();
-        return fetch(url, { method: "GET" }).then(res => {
-            this._handleTokenRefresh(res);
-            return res.json();
-        });
+        return this._request("GET", action, params);
     }
 
-    _handleTokenRefresh(res) {
-        const newToken = res.headers.get("X-New-Token");
-        if (newToken) {
-            console.log("🔄 Token auto-refreshed");
-            this.setToken(newToken);
-        }
+    _post(action, data = {}) {
+        return this._request("POST", action, data);
     }
 
     setToken(token) {
@@ -51,124 +128,162 @@ class PBLite {
     }
 
     /* ===== AUTH ===== */
-    reg(u, p) {
-        return this._post("register", { username: u, password: p });
+    async reg(username, password) {
+        return await this._post("register", { username, password });
     }
-    login(u, p) {
-        return this._post("login", { username: u, password: p }).then(res => {
-            if (res.success && res.token) this.setToken(res.token);
-            return res;
-        });
+
+    async login(username, password) {
+        const result = await this._post("login", { username, password });
+        if (result.success && result.token) {
+            this.setToken(result.token);
+        }
+        return result;
     }
+
     logout() {
         this.clearToken();
         return { success: true };
     }
-    passChange(newP) {
-        return this._post("change_password", { new_password: newP });
+
+    async passChange(newPassword) {
+        return await this._post("change_password", { new_password: newPassword });
     }
 
     /* ===== COLLECTIONS ===== */
-    colAdd(name, pub = 0) {
-        return this._post("create_collection", { name, public: +pub });
+    async colAdd(name, pub = 0) {
+        return await this._post("create_collection", { name, public: pub });
     }
-    colUpdate(name, newName, pub = null) {
+
+    async colUpdate(name, newName, pub = null) {
         const data = { name, new_name: newName };
-        if (pub !== null) data.public = +pub;
-        return this._post("update_collection", data);
+        if (pub !== null) data.public = pub;
+        return await this._post("update_collection", data);
     }
-    colDelete(name) {
-        return this._post("delete_collection", { name });
+
+    async colDelete(name) {
+        return await this._post("delete_collection", { name });
     }
-    colList() {
-        return this._get("list_collections");
+
+    async colList() {
+        return await this._get("list_collections");
     }
 
     /* ===== RECORDS ===== */
-    recAdd(colName, obj) {
-        return this._post("add_record", {
-            collection_name: colName,
-            data: JSON.stringify(obj)
+    async recAdd(collectionName, data) {
+        return await this._post("add_record", {
+            collection_name: collectionName,
+            data: JSON.stringify(data)
         });
     }
-    recUpdate(colName, id, obj) {
-        return this._post("update_record", {
-            collection_name: colName,
+
+    async recUpdate(collectionName, id, data) {
+        return await this._post("update_record", {
+            collection_name: collectionName,
             record_id: id,
-            data: JSON.stringify(obj)
+            data: JSON.stringify(data)
         });
     }
-    recDelete(colName, id) {
-        return this._post("delete_record", {
-            collection_name: colName,
+
+    async recDelete(collectionName, id) {
+        return await this._post("delete_record", {
+            collection_name: collectionName,
             record_id: id
         });
     }
-    recList(colName, search = "") {
-        return this._get("list_records", { collection_name: colName, search });
+
+    async recList(collectionName, search = "") {
+        return await this._get("list_records", { 
+            collection_name: collectionName, 
+            search 
+        });
     }
-    recGet(id) {
-        return this._get("get_record", { record_id: id });
+
+    async recGet(id) {
+        return await this._get("get_record", { record_id: id });
     }
+
     /* ===== FILES ===== */
-    fileUpload(file, collectionName = null) {
+    async fileUpload(file, collectionName = null) {
         const formData = new FormData();
         formData.append("action", "upload_file");
-        if (this.token) formData.append("token", this.token);
         formData.append("file", file);
-        if (collectionName) formData.append("collection_name", collectionName);
-
-        return fetch(this.baseUrl, { method: "POST", body: formData }).then(
-            res => {
-                this._handleTokenRefresh(res);
-                return res.json();
-            }
-        );
+        if (collectionName) {
+            formData.append("collection_name", collectionName);
+        }
+        
+        return await this._request("POST", "upload_file", formData, true);
     }
 
-    fileDownload(fileId) {
-        const params = new URLSearchParams({
-            action: "download_file",
-            file_id: fileId
-        });
-        if (this.token) params.append("token", this.token);
-
-        return fetch(`${this.baseUrl}?${params.toString()}`).then(res => {
-            if (!res.ok) throw new Error("Download failed");
-            this._handleTokenRefresh(res);
-            return res.blob();
-        });
+    async fileDownload(fileId) {
+        return await this._request("GET", "download_file", { file_id: fileId });
     }
 
-    fileDelete(fileId) {
-        return this._post("delete_file", { file_id: fileId });
+    async fileDelete(fileId) {
+        return await this._post("delete_file", { file_id: fileId });
     }
 
-    fileList() {
-        return this._get("file_list");
+    async fileList() {
+        return await this._get("file_list");
     }
+
     /* ===== ADMIN ===== */
-    admUsers() {
-        return this._get("admin_list_users");
+    async admUsers() {
+        return await this._get("admin_list_users");
     }
-    admDisable(id) {
-        return this._post("admin_disable_user", { user_id: id });
+
+    async admDisable(userId) {
+        return await this._post("admin_disable_user", { user_id: userId });
     }
-    admPromote(id) {
-        return this._post("admin_promote_user", { user_id: id });
+    
+    async admEnable(userId) {
+        return await this._post("admin_enable_user", { user_id: userId });
     }
-    admCredit(id, credits) {
-        return this._post("admin_add_credit", { user_id: id, credits });
+
+    async admPromote(userId) {
+        return await this._post("admin_promote_user", { user_id: userId });
     }
-    admWipe(colId) {
-        return this._post("admin_wipe_collection", { collection_id: colId });
+
+    async admCredit(userId, credits) {
+        return await this._post("admin_add_credit", { user_id: userId, credits });
     }
-    admSetLimits(id, pm, pd, pmth) {
-        return this._post("admin_set_user_limits", {
-            user_id: id,
-            per_minute: pm,
-            per_day: pd,
-            per_month: pmth
+
+    async admWipe(collectionId) {
+        return await this._post("admin_wipe_collection", { collection_id: collectionId });
+    }
+
+    async admSetLimits(userId, perMinute, perDay, perMonth) {
+        return await this._post("admin_set_user_limits", {
+            user_id: userId,
+            per_minute: perMinute,
+            per_day: perDay,
+            per_month: perMonth
         });
     }
+
+    /* ===== UTILITY ===== */
+    async ping() {
+        return await this._get("ping");
+    }
+
+    getToken() {
+        return this.token;
+    }
+
+    isAuthenticated() {
+        return !!this.token && this.token !== 'null' && this.token !== 'undefined';
+    }
+
+    enableDebug() {
+        this.debug = true;
+    }
+}
+
+// Export for ES modules
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = PBLite;
+}
+
+// Global for browser
+if (typeof window !== 'undefined') {
+    window.PBLite = PBLite;
 }
